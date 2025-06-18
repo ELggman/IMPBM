@@ -84,7 +84,7 @@ class KGPrompt(nn.Module):
             )
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.gc = SIGVAE(
+        self.gc = GCNModelSIGVAE(
             384, 768, 384, 384, 0.0,
             encsto='semi',
             ndist='Bernoulli',
@@ -97,7 +97,7 @@ class KGPrompt(nn.Module):
         self.node_embeds.data = node_embeds
         self.node_embeds.requires_grad_(False)
 
-
+    # 构建无向邻接矩阵 (Tensor)
     def build_adjacency_matrix(self, node_list, edges):
         matrix_size = len(node_list)
         adjacency_matrix = torch.zeros((matrix_size, matrix_size), dtype=torch.float32)
@@ -107,7 +107,7 @@ class KGPrompt(nn.Module):
                 row = node_list.index(edge[0])
                 col = node_list.index(edge[1])
                 adjacency_matrix[row, col] = 1
-                adjacency_matrix[col, row] = 1  
+                adjacency_matrix[col, row] = 1  # 确保无向边
 
         degrees = adjacency_matrix.sum(axis=1)
         degree_matrix_inv_sqrt = torch.diag(torch.pow(degrees, -0.5))
@@ -115,7 +115,7 @@ class KGPrompt(nn.Module):
         normalized_adj_matrix = degree_matrix_inv_sqrt @ adjacency_matrix @ degree_matrix_inv_sqrt
         return normalized_adj_matrix
 
-
+    # 将 edges 转换为 2 维数据
     def convert_edges_to_2d(self, edges):
         batch_size, num_edges = edges.shape
 
@@ -126,7 +126,7 @@ class KGPrompt(nn.Module):
 
         return edges_reshaped
 
-
+    # 构建无向邻接矩阵并进行规范化 (Tensor)
     def build_and_normalize_adjacency_matrix(self, node_list, edges):
         batch_size, num_nodes = node_list.shape
         adjacency_matrices = torch.zeros((batch_size, num_nodes, num_nodes), dtype=torch.float32,
@@ -147,11 +147,11 @@ class KGPrompt(nn.Module):
         batch_indices = torch.arange(edges.shape[0]).unsqueeze(1).expand(-1, edges.shape[1])
 
         adjacency_matrices[batch_indices, row_indices, col_indices] = 1
-        adjacency_matrices[batch_indices, col_indices, row_indices] = 1  
+        adjacency_matrices[batch_indices, col_indices, row_indices] = 1  # 确保无向边
 
         degrees = adjacency_matrices.sum(dim=-1)
         degrees = torch.where(degrees == 1, torch.full_like(degrees, 2), degrees)
-        degrees = torch.where(degrees == 0, torch.ones_like(degrees), degrees)  
+        degrees = torch.where(degrees == 0, torch.ones_like(degrees), degrees)  # 避免除以0
 
         with torch.no_grad():
             degree_matrix_inv_sqrt = torch.pow(degrees, -0.5).unsqueeze(2)
@@ -163,7 +163,7 @@ class KGPrompt(nn.Module):
         return normalized_adj_matrices
 
     def get_index(self, A, B):
-
+        # 在batch维度上进行矢量化操作
         for i in range(A.shape[0]):
             assert set(B[i].tolist()).issubset(set(A[i].tolist())), f"Batch {i} failed!"
         sorted_A, sorted_indices = torch.sort(A, dim=1)
@@ -171,10 +171,10 @@ class KGPrompt(nn.Module):
         sorted_A = sorted_A.contiguous()
         B = B.contiguous()
 
-
+        # 对每个batch应用torch.searchsorted
         B_indices_in_sorted_A = torch.searchsorted(sorted_A, B, right=False)
 
-
+        # 使用sorted_indices来获取B在A中的原始位置
         E = torch.gather(sorted_indices, 1, B_indices_in_sorted_A)
 
         return E
@@ -198,7 +198,7 @@ class KGPrompt(nn.Module):
 
             entity_embeds = self.get_entity_embeds(node_list, edges, shape)
 
-
+            # 这里将 shape设置为None是为了进行消融实验
             # shape = None
             rgcn_emb.append(entity_embeds[entity_ids].cpu().numpy())
             if shape is not None:
@@ -214,19 +214,21 @@ class KGPrompt(nn.Module):
                 cau_emb.append(entity_embeds.cpu().numpy())
 
             else:
-                entity_embeds = entity_embeds[entity_ids]  # (batch_size, entity_len, hidden_size) 
+                entity_embeds = entity_embeds[entity_ids]  # (batch_size, entity_len, hidden_size) # 获取数据中 entity 的嵌入
 
         if token_embeds is not None:
             batch_size, token_len = token_embeds.shape[:2]
             token_embeds = self.token_proj1(
-                token_embeds) + token_embeds  # (batch_size, token_len, hidden_size) 
+                token_embeds) + token_embeds  # (batch_size, token_len, hidden_size) # 对话的隐藏状态 cls 进行线性变换
             token_embeds = self.token_proj2(token_embeds)
 
-
+        # 这里将entity_embeds设置为None是为了进行消融实验
         # entity_embeds = None
 
         if entity_embeds is not None and token_embeds is not None:
-            attn_weights = self.cross_attn(token_embeds) @ entity_embeds.permute(0, 2, 1)  
+            attn_weights = self.cross_attn(token_embeds) @ entity_embeds.permute(0, 2,
+                                                                                 # 这个 cross_attn 就是一个线性层 在论文中的公式对应于 W ，attn_wights对应于公式中的A
+                                                                                 1)  # (batch_size, token_len, entity_len)
             attn_weights /= self.hidden_size
 
             if output_entity:
@@ -258,6 +260,13 @@ class KGPrompt(nn.Module):
         prompt_embeds = self.prompt_proj1(prompt_embeds) + prompt_embeds
         prompt_embeds = self.prompt_proj2(prompt_embeds)
 
+        '''
+            在这里将 prompt_embeds 与 past_key_values 进行融合，形状都是(batch_size, seq_len, head_dim)
+            
+            特有提示为主，公共提示为辅
+            
+        '''
+        # 方法1 进行乘积然后
 
         if prefix_embeds1 is not None:
             # fusion_weights = F.softmax(prompt_embeds @ prefix_embeds.permute(0, 2, 1), dim=2)
@@ -323,10 +332,10 @@ class PrefixEncoder(torch.nn.Module):
 
     def forward(self, batch_size, tune_flag=False):
         prefix_tokens = self.prefix_tokens.unsqueeze(0).expand(batch_size, -1).to(self.device)
-
+        # 使用前缀编码器对前缀标记进行编码，得到过去的键值
         past_key_values = self.embedding(prefix_tokens)
         if tune_flag:
-
+            # 重塑过去的键值张量的形状，使其符合预定的维度
             past_key_values = past_key_values.view(
                 batch_size,
                 self.pre_seq_len,
@@ -717,7 +726,7 @@ class GPT2Model(GPT2PreTrainedModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache  
+        use_cache = use_cache if use_cache is not None else self.config.use_cache  # 这里将 use_caches 设置为了True
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_ids is not None and inputs_embeds is not None:
@@ -747,7 +756,7 @@ class GPT2Model(GPT2PreTrainedModel):
             if prompt_embeds is not None:
                 prompt_attention_mask = prompt_embeds.new_ones((batch_size, prompt_embeds.shape[-2]))
                 attention_mask = torch.cat([prompt_attention_mask, attention_mask],
-                                           dim=-1)  
+                                           dim=-1)  # 在这里会对提示的attention_mask 进行拼接
             # We create a 3D attention mask from a 2D tensor mask.
             # Sizes are [batch_size, 1, 1, to_seq_length]
             # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
@@ -761,7 +770,7 @@ class GPT2Model(GPT2PreTrainedModel):
             # Since we are adding it to the raw scores before the softmax, this is
             # effectively the same as removing these entirely.
             attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
-            attention_mask = (1.0 - attention_mask) * -10000.0 
+            attention_mask = (1.0 - attention_mask) * -10000.0  # 这里为什么会将attention_mask变为-0 这样会导致在注意力阶段忽略所有的输入
 
         if past_key_values is None:
             past_length = 0
@@ -850,7 +859,7 @@ class GPT2Model(GPT2PreTrainedModel):
                 )
             else:
                 outputs = block(
-                    hidden_states,  
+                    hidden_states,  # hidden_states 是input_ids position_ids相加
                     layer_past=layer_past,
                     prompt_embeds=prompt_embeds[i] if prompt_embeds is not None else None,
                     attention_mask=attention_mask,
@@ -909,7 +918,7 @@ class GPT2_crs(GPT2PreTrainedModel):
 
         self.init_weights()
 
-       
+        # 冻结参数
         for param in self.transformer.parameters():
             param.requires_grad = False
 
@@ -917,20 +926,22 @@ class GPT2_crs(GPT2PreTrainedModel):
         self.hidden_size = config.hidden_size
         self.entity_hidden_size = self.hidden_size // 2
 
- 
-        self.local_pred = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size // 2, self.hidden_size)
-        )
-        self.global_pred = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size // 2, 1),
-            nn.Sigmoid(),
-            nn.Flatten(start_dim=0)
-        )
-        self.f = nn.Sigmoid()
+        '''
+        下面是添加gp pp
+        '''
+        # self.local_pred = nn.Sequential(
+        #     nn.Linear(self.hidden_size, self.hidden_size // 2),
+        #     nn.ReLU(),
+        #     nn.Linear(self.hidden_size // 2, self.hidden_size)
+        # )
+        # self.global_pred = nn.Sequential(
+        #     nn.Linear(self.hidden_size, self.hidden_size // 2),
+        #     nn.ReLU(),
+        #     nn.Linear(self.hidden_size // 2, 1),
+        #     nn.Sigmoid(),
+        #     nn.Flatten(start_dim=0)
+        # )
+        # self.f = nn.Sigmoid()
         # self.gamma = 64
         # self.beta = -32
         self.gamma = 0
@@ -1047,17 +1058,17 @@ class GPT2_crs(GPT2PreTrainedModel):
 
             rec_logits = hidden_states[range(batch_size), sequence_lengths]  # (bs, hidden_size)
             ''''''
-
+            # 用户表示
             user_emb.append(rec_logits.cpu().numpy())
             # user_emb.append(rec_logits)
             ''''''
             # rec_logits @= entity_embeds.T  # (bs, n_item)
             rec_logits1 = torch.matmul(rec_logits, entity_embeds.T)
 
-            user_ci_emb = self.local_pred(rec_logits)
-            item_ci_emb = self.local_pred(entity_embeds)
-            pred_local = self.f(torch.matmul(user_ci_emb, item_ci_emb.T))
-            pred_global = self.global_pred(entity_embeds).expand(rec_logits1.shape)
+            # user_ci_emb = self.local_pred(rec_logits)
+            # item_ci_emb = self.local_pred(entity_embeds)
+            # pred_local = self.f(torch.matmul(user_ci_emb, item_ci_emb.T))
+            # pred_global = self.global_pred(entity_embeds).expand(rec_logits1.shape)
             #
             real_local = local_pop[seeker_id]
             real_global = global_pop.expand(rec_logits1.shape)
