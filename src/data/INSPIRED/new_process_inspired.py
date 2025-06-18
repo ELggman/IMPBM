@@ -3,14 +3,14 @@ from tqdm.auto import tqdm
 from collections import defaultdict
 
 
-# 从文件中读取 JSON 数据
+
 def read_json_file(file_path):
     with open(file_path, 'r') as file:
         data = json.load(file)
     return data
 
 
-# 提取目标节点指向的节点和边，并直接返回节点列表、边和节点索引
+
 def extract_k_hop_nodes(data, target_nodes, k):
     all_nodes = set(target_nodes)
     edges = []
@@ -24,7 +24,7 @@ def extract_k_hop_nodes(data, target_nodes, k):
                     if neighbor not in all_nodes:
                         next_level_nodes.add(neighbor)
                         edges.append((node, neighbor))
-                        # edges.append((neighbor, node))  # 添加反向边以创建无向图
+                        # edges.append((neighbor, node))  
         all_nodes.update(next_level_nodes)
         current_level_nodes = next_level_nodes
 
@@ -33,13 +33,13 @@ def extract_k_hop_nodes(data, target_nodes, k):
     # node_list.sort(key=lambda x: (
     # x in target_nodes, target_nodes.index(x) if x in target_nodes else len(target_nodes) + node_list.index(x)))
 
-    # 保持 target_nodes 在前面的顺序
+
     target_node_set = set(target_nodes)
     remaining_nodes = list(all_nodes - target_node_set)
     node_list = target_nodes + remaining_nodes
 
     node_list = list(set(node_list))
-    # 将edges 展平到1维
+
     edges = [item for sublist in edges for item in sublist]
 
     return node_list, edges
@@ -71,9 +71,9 @@ def process(data_file, out_file, movie_set, data, user_item_interaction):
                 adj_shape = 0
                 e_list = [e for e in entity_list if str(e) in data]
                 if e_list:
-                    k = 3  # 跳数
+                    k = 3  # hops
 
-                    # 提取 k 跳节点和边
+                    
                     node_list, edges = extract_k_hop_nodes(data, e_list, k)
                     adj_shape = len(node_list)
                     node_list = list(set(node_list + entity_list))
@@ -114,7 +114,7 @@ if __name__ == '__main__':
         entity2id = json.load(f)
     item_set = set()
 
-    file_path = r"dbpedia_subkg.json"  # 替换为实际文件路径
+    file_path = r"dbpedia_subkg.json"  
     data = read_json_file(file_path)
     user_item_interaction = defaultdict(set)
 
